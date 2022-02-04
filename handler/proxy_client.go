@@ -108,6 +108,10 @@ func (p *ProxyClient) Do(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	headers := ""
+	for k, v := range req.Header {
+		headers += fmt.Sprintf("%s=%s", k, v)
+	}
 
 	var service *endpoints.ResolvedEndpoint
 	if p.SigningNameOverride != "" && p.RegionOverride != "" {
@@ -139,7 +143,7 @@ func (p *ProxyClient) Do(req *http.Request) (*http.Response, error) {
 		}
 		log.WithField("request", string(proxyReqDump)).Debug("proxying request")
 	}
-
+		
 	resp, err := p.Client.Do(proxyReq)
 	if err != nil {
 		return nil, err
@@ -149,6 +153,7 @@ func (p *ProxyClient) Do(req *http.Request) (*http.Response, error) {
 		b, _ := ioutil.ReadAll(resp.Body)
 		log.WithField("request", fmt.Sprintf("%s %s", proxyReq.Method, proxyReq.URL)).
 			WithField("status_code", resp.StatusCode).
+			WithField("headers", headers).
 			WithField("message", string(b)).
 			Error("error proxying request")
 

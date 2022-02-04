@@ -16,9 +16,12 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
+	"io/ioutil"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -30,6 +33,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws/endpoints"
 	"github.com/aws/aws-sdk-go/aws/session"
 	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
+	"github.com/gorilla/mux"
+	"github.com/hashicorp/go-retryablehttp"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
@@ -45,6 +52,7 @@ var (
 	hostOverride           = kingpin.Flag("host", "Host to proxy to").String()
 	regionOverride         = kingpin.Flag("region", "AWS region to sign for").String()
 	disableSSLVerification = kingpin.Flag("no-verify-ssl", "Disable peer SSL certificate validation").Bool()
+	retries                = kingpin.Flag("retries", "number of retries on failed requests").Default("5").Short('r').Int()
 )
 
 type awsLoggerAdapter struct {
@@ -54,7 +62,9 @@ type awsLoggerAdapter struct {
 func (awsLoggerAdapter) Log(args ...interface{}) {
 	log.Info(args...)
 }
-
+func init() {
+	prometheus.Register(totalRequests)
+}
 func main() {
 	kingpin.Parse()
 
@@ -103,27 +113,38 @@ func main() {
 			s.Debug = aws.LogDebugWithSigning
 		}
 	})
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+
+	var client *http.Client
+	if *retries > 0 {
+		client = makeRetryable()
+	} else {
+		client = &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 	}
 
 	log.WithFields(log.Fields{"StripHeaders": *strip}).Infof("Stripping headers %s", *strip)
 	log.WithFields(log.Fields{"port": *port}).Infof("Listening on %s", *port)
 
+	router := mux.NewRouter()
+	router.Use(prometheusMiddleware)
+	router.Path("/metrics").Handler(promhttp.Handler())
+	router.PathPrefix("/").Handler(&handler.Handler{
+		ProxyClient: &handler.ProxyClient{
+			Signer:              signer,
+			Client:              client,
+			StripRequestHeaders: *strip,
+			SigningNameOverride: *signingNameOverride,
+			HostOverride:        *hostOverride,
+			RegionOverride:      *regionOverride,
+			LogFailedRequest:    *logFailedResponse,
+		},
+	})
+
 	log.Fatal(
-		http.ListenAndServe(*port, &handler.Handler{
-			ProxyClient: &handler.ProxyClient{
-				Signer:              signer,
-				Client:              client,
-				StripRequestHeaders: *strip,
-				SigningNameOverride: *signingNameOverride,
-				HostOverride:        *hostOverride,
-				RegionOverride:      *regionOverride,
-				LogFailedRequest:    *logFailedResponse,
-			},
-		}),
+		http.ListenAndServe(*port, router),
 	)
 }
 
@@ -134,6 +155,59 @@ func roleSessionName() string {
 		now := time.Now().Unix()
 		suffix = strconv.FormatInt(now, 10)
 	}
-
 	return "aws-sigv4-proxy-" + suffix
+}
+
+// setup the retryablehttp client
+func makeRetryable() *http.Client {
+	rclient := retryablehttp.NewClient()
+	rclient.RetryMax = *retries
+	rclient.RetryWaitMin = 100 * time.Millisecond
+	rclient.RetryWaitMax = 1000 * time.Millisecond
+	rclient.HTTPClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	// retry attempts are logged at debug so don't need to add that. May want to add something
+	// to prometheus here so leaving the example commented out.
+	//
+	// rclient.RequestLogHook = func(_ retryablehttp.Logger, _ *http.Request, attempt int) {
+	// 	// no need to log if there's no retry
+	// 	if attempt > 0 {
+	// 		log.WithFields(log.Fields{
+	// 			"attempt": attempt,
+	// 		}).Debug("Retrying request")
+	// 	}
+	// }
+	throttleErrorRe := regexp.MustCompile(`<ThrottlingException`)
+	rclient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		b, _ := ioutil.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusBadRequest && throttleErrorRe.MatchString(string(b)) {
+			return true, nil
+		}
+		// don't propagate other errors
+		shouldRetry, _ := retryablehttp.DefaultRetryPolicy(ctx, resp, err)
+		return shouldRetry, nil
+	}
+	return rclient.StandardClient()
+}
+
+// add prometheus metrics
+var totalRequests = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "http_requests_total",
+		Help: "Number of get requests.",
+	},
+	[]string{"path"},
+)
+
+func prometheusMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		route := mux.CurrentRoute(r)
+		path, _ := route.GetPathTemplate()
+		//rw := http.NewResponseWriter()
+		next.ServeHTTP(w, r)
+
+		totalRequests.WithLabelValues(path).Inc()
+	})
+
 }
