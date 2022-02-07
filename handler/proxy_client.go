@@ -86,6 +86,7 @@ func copyHeaderWithoutOverwrite(dst, src http.Header) {
 	}
 }
 
+// Do executes the handler code and produces a response
 func (p *ProxyClient) Do(req *http.Request) (*http.Response, error) {
 	proxyURL := *req.URL
 	if p.HostOverride != "" {
@@ -143,7 +144,7 @@ func (p *ProxyClient) Do(req *http.Request) (*http.Response, error) {
 		}
 		log.WithField("request", string(proxyReqDump)).Debug("proxying request")
 	}
-		
+
 	resp, err := p.Client.Do(proxyReq)
 	if err != nil {
 		return nil, err

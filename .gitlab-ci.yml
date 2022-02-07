@@ -1,0 +1,79 @@
+variables:
+  GOLANG_IMAGE: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/golang:1.17
+
+stages:
+  - unit test and lint
+  - build
+  - publish
+
+
+# The shared runners provided by Nimbus use the docker+machine executor, but GitLab's docs for doing Docker-in-Docker
+# (DinD) builds using the docker executor still apply
+# https://docs.gitlab.com/ee/ci/docker/using_docker_build.html#use-docker-in-docker-workflow-with-docker-executor
+# DOCKER_AUTH_CONFIG contains credentials for Dockerhub to avoid rate limiting
+.docker:
+  image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/docker:20.10
+  services:
+    - name: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/docker:20.10-dind
+      alias: docker
+  before_script:
+    - mkdir -p $HOME/.docker
+    - echo $DOCKER_AUTH_CONFIG > $HOME/.docker/config.json
+    - docker login -u $CI_DEPENDENCY_PROXY_USER -p $CI_DEPENDENCY_PROXY_PASSWORD $CI_DEPENDENCY_PROXY_SERVER
+    - docker login -u $CI_REGISTRY_USER -p $CI_JOB_TOKEN $CI_REGISTRY
+  variables:
+    # The shared runners provided by Nimbus don't support connection to the Docker daemon over TLS
+    # https://docs.gitlab.com/ee/ci/docker/using_docker_build.html#tls-disabled
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    # By default, when using docker:dind, Docker uses the vfs storage driver which copies the filesystem on every run.
+    # This is a disk-intensive operation which can be avoided if a different driver is used, for example overlay2
+    # https://docs.gitlab.com/ee/ci/docker/using_docker_build.html#use-the-overlayfs-driver
+    DOCKER_DRIVER: overlay2
+  tags:
+    # The shared runners provided by Nimbus for DinD builds are registered with this tag
+    - docker
+
+docker build:
+  stage: build
+  extends: .docker
+  variables:
+    IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  script:
+    - docker build --build-arg CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX=${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/ -t $IMAGE_TAG .
+    - docker push $IMAGE_TAG
+
+.go_setup: &go_setup
+  image: $GOLANG_IMAGE
+  # Set GOPATH and GOCACHE within the project directory so that we are able to
+  # cache module dependencies, build outputs, and test results, but ensure
+  # GOBIN is set to the default so that it is in PATH
+  variables:
+    GOPATH: $CI_PROJECT_DIR/.go
+    GOCACHE: $CI_PROJECT_DIR/.go/.cache
+    GOBIN: /go/bin
+
+.go_test:
+  extends: .go_setup
+  stage: unit test and lint
+  script:
+    # We set 'cache: {}' and GO111MODULE=off to avoid downloading Go module dependencies
+    - GO111MODULE=off go get -u github.com/jstemmer/go-junit-report
+    - go test -v ./... 2>&1 | tee /dev/stderr | go-junit-report > $CI_PROJECT_DIR/report.xml
+  artifacts:
+    reports:
+      junit: report.xml
+
+go test:
+  stage: unit test and lint
+  extends: .go_test
+
+golint:
+  extends: .go_setup
+  stage: unit test and lint
+  cache: {}
+  script:
+    # We set 'cache: {}' and GO111MODULE=off to avoid downloading Go module dependencies
+    - go install golang.org/x/lint/golint@latest
+    - git ls-files -- '*.go' ':^*generated*.go' | xargs -n1 golint -set_exit_status
+

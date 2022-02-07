@@ -35,7 +35,7 @@ func (m *mockProxyClient) Do(req *http.Request) (*http.Response, error) {
 	if m.Fail {
 		return nil, fmt.Errorf("mockProxyClient.Do failed")
 	}
-
+	m.Response.StatusCode = http.StatusOK
 	return m.Response, nil
 }
 func TestHandler_ServeHTTP(t *testing.T) {
